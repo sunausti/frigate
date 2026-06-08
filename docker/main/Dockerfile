@@ -60,6 +60,18 @@ ARG DEBIAN_FRONTEND
 RUN --mount=type=bind,source=docker/main/build_intel_media_driver.sh,target=/deps/build_intel_media_driver.sh \
     /deps/build_intel_media_driver.sh
 
+# Intel NPU driver libraries (needed for OpenVINO NPU plugin at runtime)
+FROM openvino/ubuntu24_dev:2026.2.0 AS npu-libs
+USER root
+RUN mkdir -p /npu-rootfs/usr/lib/x86_64-linux-gnu && \
+    cp /usr/lib/x86_64-linux-gnu/libnpu_driver_compiler.so /npu-rootfs/usr/lib/x86_64-linux-gnu/ && \
+    cp /usr/lib/x86_64-linux-gnu/libze_intel_npu.so.1.32.1 /npu-rootfs/usr/lib/x86_64-linux-gnu/ && \
+    ln -s libze_intel_npu.so.1.32.1 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_intel_npu.so.1 && \
+    ln -s libze_intel_npu.so.1 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_intel_npu.so && \
+    cp /usr/lib/x86_64-linux-gnu/libze_loader.so.1.27.0 /npu-rootfs/usr/lib/x86_64-linux-gnu/ && \
+    ln -s libze_loader.so.1.27.0 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_loader.so.1 && \
+    ln -s libze_loader.so.1 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_loader.so
+
 FROM scratch AS go2rtc
 ARG TARGETARCH
 WORKDIR /rootfs/usr/local/go2rtc/bin
@@ -209,6 +221,7 @@ FROM scratch AS deps-rootfs
 COPY --from=nginx /usr/local/nginx/ /usr/local/nginx/
 COPY --from=sqlite-vec /usr/local/lib/ /usr/local/lib/
 COPY --from=intel-media-driver /rootfs/ /
+COPY --from=npu-libs /npu-rootfs/ /
 COPY --from=go2rtc /rootfs/ /
 COPY --from=libusb-build /usr/local/lib /usr/local/lib
 COPY --from=tempio /rootfs/ /

@@ -263,10 +263,18 @@ class CudaGraphRunner(BaseModelRunner):
 class OpenVINOModelRunner(BaseModelRunner):
     """OpenVINO model runner that handles inference efficiently."""
 
+    # Default static width for PaddleOCR recognition model on NPU.
+    # NPU requires static input shapes; this width accommodates most license plates.
+    PADDLEOCR_NPU_RECOGNITION_WIDTH = 320
+
     @staticmethod
-    def is_complex_model(model_type: str) -> bool:
+    def is_complex_model(model_type: str, device: str = "") -> bool:
         # Import here to avoid circular imports
         from frigate.embeddings.types import EnrichmentModelTypeEnum
+
+        # PaddleOCR on NPU does not need reset_state() — NPU handles state internally
+        if device == "NPU" and model_type == EnrichmentModelTypeEnum.paddleocr.value:
+            return False
 
         return model_type in [
             EnrichmentModelTypeEnum.paddleocr.value,
@@ -279,7 +287,6 @@ class OpenVINOModelRunner(BaseModelRunner):
         from frigate.embeddings.types import EnrichmentModelTypeEnum
 
         return model_type not in [
-            EnrichmentModelTypeEnum.paddleocr.value,
             EnrichmentModelTypeEnum.jina_v1.value,
             EnrichmentModelTypeEnum.jina_v2.value,
             EnrichmentModelTypeEnum.arcface.value,
@@ -305,7 +312,7 @@ class OpenVINOModelRunner(BaseModelRunner):
             )
             device = "GPU"
 
-        self.complex_model = OpenVINOModelRunner.is_complex_model(model_type)
+        self.complex_model = OpenVINOModelRunner.is_complex_model(model_type, device)
 
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"OpenVINO model file {model_path} not found.")
@@ -331,9 +338,53 @@ class OpenVINOModelRunner(BaseModelRunner):
 
         # Compile model under the shared lock
         with _OPENVINO_LOCK:
-            self.compiled_model = self.ov_core.compile_model(
-                model=model_path, device_name=device
-            )
+            # For PaddleOCR models on NPU, reshape to static input shape
+            # NPU requires all dimensions to be static at compile time
+            if device == "NPU" and self._needs_npu_static_reshape(model_type):
+                model = self.ov_core.read_model(model_path)
+                static_shape = self._get_npu_static_shape(model, model_type)
+                if static_shape:
+                    try:
+                        logger.info(
+                            "Reshaping %s model to static shape %s for NPU",
+                            model_type,
+                            static_shape,
+                        )
+                        model.reshape(static_shape)
+                        self.compiled_model = self.ov_core.compile_model(
+                            model=model, device_name=device
+                        )
+                    except RuntimeError as e:
+                        logger.warning(
+                            "Failed to compile %s model on NPU with static shape %s: %s. "
+                            "Falling back to CPU",
+                            model_type,
+                            static_shape,
+                            e,
+                        )
+                        self.compiled_model = self.ov_core.compile_model(
+                            model=model_path, device_name="CPU"
+                        )
+                else:
+                    # Model has fully static shapes or can't determine target shape
+                    # Try NPU directly, fall back to CPU if it fails
+                    try:
+                        self.compiled_model = self.ov_core.compile_model(
+                            model=model, device_name=device
+                        )
+                    except RuntimeError as e:
+                        logger.warning(
+                            "Failed to compile %s model on NPU: %s. Falling back to CPU",
+                            model_type,
+                            e,
+                        )
+                        self.compiled_model = self.ov_core.compile_model(
+                            model=model_path, device_name="CPU"
+                        )
+            else:
+                self.compiled_model = self.ov_core.compile_model(
+                    model=model_path, device_name=device
+                )
 
             # Create reusable inference request
             self.infer_request = self.compiled_model.create_infer_request()
@@ -374,6 +425,85 @@ class OpenVINOModelRunner(BaseModelRunner):
             except Exception:
                 return -1
 
+    @staticmethod
+    def _needs_npu_static_reshape(model_type: str) -> bool:
+        """Check if a model needs static reshape for NPU compilation.
+
+        NPU requires all input dimensions to be static. PaddleOCR models
+        have dynamic dimensions that must be fixed before compilation.
+        """
+        from frigate.embeddings.types import EnrichmentModelTypeEnum
+
+        return model_type == EnrichmentModelTypeEnum.paddleocr.value
+
+    # Default static shapes for PaddleOCR models on NPU.
+    # Classification: fixed 48x192 (from _preprocess_classification_image)
+    # Recognition: fixed 48xW where W=PADDLEOCR_NPU_RECOGNITION_WIDTH
+    # Detection: NOT reshaped (needs variable spatial input)
+    PADDLEOCR_NPU_CLASSIFICATION_SHAPE = (48, 192)
+
+    def _get_npu_static_shape(
+        self, model: "ov.Model", model_type: str
+    ) -> dict[str, list[int]] | None:
+        """Get the static shape to use for NPU compilation.
+
+        Returns a dict mapping input names to static shapes, or None if
+        the model already has static inputs or can't be statically reshaped.
+
+        Determines the correct shape based on model input characteristics:
+        - Recognition: [?,3,48,?] -> [1,3,48,320] (H=48 is static, only W dynamic)
+        - Classification: [?,3,?,?] with output rank=2 -> [1,3,48,192]
+        - Detection: [?,3,?,?] with spatial output -> None (can't use fixed shape)
+        """
+        inputs = model.inputs
+        if not inputs:
+            return None
+
+        first_input = inputs[0]
+        partial_shape = first_input.get_partial_shape()
+
+        # Check if all dimensions are already static
+        if all(dim.is_static for dim in partial_shape):
+            return None
+
+        input_name = first_input.get_any_name()
+        rank = partial_shape.rank.get_length()
+
+        if rank != 4:
+            return None
+
+        # NCHW format — determine model type from shape pattern
+        n = 1
+        c = partial_shape[1].get_length() if partial_shape[1].is_static else 3
+        h_static = partial_shape[2].is_static
+        w_static = partial_shape[3].is_static
+
+        if h_static and partial_shape[2].get_length() == 48 and not w_static:
+            # Recognition model: [?,3,48,?] — only width is dynamic
+            h = 48
+            w = self.PADDLEOCR_NPU_RECOGNITION_WIDTH
+            return {input_name: [n, c, h, w]}
+
+        if not h_static and not w_static:
+            # Both H and W are dynamic — could be detection or classification.
+            # Check output shape to distinguish:
+            # - Classification: output is [?,2] (rank 2, 2 classes)
+            # - Detection: output is [?,1,H,W] (rank 4, spatial)
+            if model.outputs:
+                out_shape = model.outputs[0].get_partial_shape()
+                out_rank = out_shape.rank.get_length()
+                if out_rank == 2:
+                    # Classification model: fixed 48x192
+                    h, w = self.PADDLEOCR_NPU_CLASSIFICATION_SHAPE
+                    return {input_name: [n, c, h, w]}
+                else:
+                    # Detection model: spatial output depends on input size.
+                    # Cannot use a fixed shape without changing preprocessing.
+                    # Return None to signal this model can't be statically reshaped.
+                    return None
+
+        return None
+
     def run(self, inputs: dict[str, Any]) -> list[np.ndarray]:
         """Run inference with the model.
 
@@ -403,6 +533,15 @@ class OpenVINOModelRunner(BaseModelRunner):
             ):
                 # Single input case - use the pre-allocated tensor for efficiency
                 input_data = list(inputs.values())[0]
+
+                # Handle batch>1 with static batch=1 model (e.g., NPU with static shape)
+                if (
+                    input_data.ndim >= 2
+                    and input_data.shape[0] > 1
+                    and self.input_tensor.shape[0] == 1
+                ):
+                    return self._run_batched_single_input(input_data)
+
                 np.copyto(self.input_tensor.data, input_data)
                 self.infer_request.infer(self.input_tensor)
             else:
@@ -460,6 +599,30 @@ class OpenVINOModelRunner(BaseModelRunner):
                 outputs.append(self.infer_request.get_output_tensor(i).data)
 
             return outputs
+
+    def _run_batched_single_input(self, input_data: np.ndarray) -> list[np.ndarray]:
+        """Run inference one sample at a time for models with static batch=1.
+
+        This handles the case where the model is compiled with static batch size 1
+        (e.g., on NPU) but the caller provides a batch of inputs.
+        """
+        batch_size = input_data.shape[0]
+        all_outputs: list[list[np.ndarray]] = [
+            [] for _ in range(len(self.compiled_model.outputs))
+        ]
+
+        for i in range(batch_size):
+            single_input = input_data[i : i + 1]
+            np.copyto(self.input_tensor.data, single_input)
+            self.infer_request.infer(self.input_tensor)
+
+            for j in range(len(self.compiled_model.outputs)):
+                all_outputs[j].append(
+                    self.infer_request.get_output_tensor(j).data.copy()
+                )
+
+        # Concatenate batch results along the batch dimension
+        return [np.concatenate(out, axis=0) for out in all_outputs]
 
 
 class RKNNModelRunner(BaseModelRunner):
