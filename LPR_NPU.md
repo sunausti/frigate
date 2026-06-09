@@ -165,6 +165,113 @@ mkdir -p /path/to/config/model_cache/yolov9_license_plate
 # - yolov9_license_plate/yolov9-256-license-plates.onnx
 ```
 
+## Testing
+
+### Test Files
+
+Test images and script are located in `tests/lpr_npu/`:
+
+```
+tests/lpr_npu/
+├── test_lpr_npu.py      # Standalone LPR test script
+├── 103.jpg              # CCPD2019 test image (皖A·SD888)
+└── 88.jpg               # CCPD2019 test image (皖A·QK091)
+```
+
+### Running the Test
+
+**Step 1**: Start the container with test images mounted:
+
+```bash
+# On device (via adb shell)
+docker run --rm -d --name frigate_lpr_test \
+  --network host \
+  --device /dev/accel0:/dev/accel/accel0 \
+  --device /dev/dri:/dev/dri \
+  -v /path/to/config:/config \
+  -v /path/to/tests/lpr_npu:/test_images \
+  frigate:LPR_OV202602_v2
+```
+
+**Step 2**: Wait for Frigate to finish starting (~20s), then run the test script:
+
+```bash
+docker exec frigate_lpr_test python3 /test_images/test_lpr_npu.py /test_images /config/model_cache
+```
+
+**Step 3**: Expected output:
+
+```
+============================================================
+LPR NPU Test
+============================================================
+OpenVINO version: 2026.2.0-21903-52ddc073857-releases/2026/2
+
+Available devices: ['CPU', 'GPU', 'NPU']
+
+Loading detection model on CPU...
+  OK
+Loading classification model on NPU...
+  OK
+Loading recognition model on NPU...
+  OK
+Loaded 6625 characters from dictionary
+
+Processing 2 image(s)...
+
+--- 103.jpg (720x1160) ---
+  Detection (608x960, CPU): 76.7ms
+  Found 1 text region(s)
+  Plate[0] (47,350)-(549,509): "皖A·SD888" (NPU, 12.0ms)
+
+--- 88.jpg (720x1160) ---
+  Detection (608x960, CPU): 47.7ms
+  Found 1 text region(s)
+  Plate[0] (154,443)-(619,621): "皖A·QK091" (NPU, 5.8ms)
+
+============================================================
+Summary: 2 plate(s) recognized from 2 image(s)
+Device: Detection=CPU, Classification=NPU, Recognition=NPU
+============================================================
+```
+
+**Step 4**: Stop the container:
+
+```bash
+docker stop frigate_lpr_test
+```
+
+### Test via adb (end-to-end from host)
+
+```bash
+# Push test images to device
+adb shell "mkdir -p /data/vendor/docker/sunausti/test_lpr"
+adb push tests/lpr_npu/ /data/vendor/docker/sunausti/test_lpr/
+
+# Start container
+adb shell "docker run --rm -d --name frigate_lpr_test \
+  --network host \
+  --device /dev/accel0:/dev/accel/accel0 \
+  --device /dev/dri:/dev/dri \
+  -v /data/vendor/docker/sunausti/frigate_config:/config \
+  -v /data/vendor/docker/sunausti/test_lpr:/test_images \
+  frigate:LPR_OV202602_v2"
+
+# Wait for startup then run test
+sleep 20
+adb shell "docker exec frigate_lpr_test python3 /test_images/test_lpr_npu.py /test_images /config/model_cache"
+
+# Cleanup
+adb shell "docker stop frigate_lpr_test"
+```
+
+### Test Results (Intel AI Boost NPU)
+
+| Image | Plate | Device | Recognition Time |
+|-------|-------|--------|-----------------|
+| 103.jpg | 皖A·SD888 | NPU | 12.0ms (cold) / ~5.4ms (warm) |
+| 88.jpg | 皖A·QK091 | NPU | 5.8ms |
+
 ## Limitations
 
 ### PaddleOCR Detection Model Cannot Run on NPU
