@@ -324,6 +324,10 @@ class OpenVINOModelRunner(BaseModelRunner):
 
         self.ov_core = ov.Core()
 
+        # NMS parameters for models where NMS is stripped for NPU execution.
+        # When set, run() will perform CPU-based NMS post-processing.
+        self._npu_nms_params: dict | None = None
+
         # Apply performance optimization
         self.ov_core.set_property(device, {"PERF_COUNT": "NO"})
 
@@ -338,8 +342,8 @@ class OpenVINOModelRunner(BaseModelRunner):
 
         # Compile model under the shared lock
         with _OPENVINO_LOCK:
-            # For PaddleOCR models on NPU, reshape to static input shape
-            # NPU requires all dimensions to be static at compile time
+            # For models on NPU that need static shapes
+            # NPU requires all dimensions (input AND output) to be static at compile time
             if device == "NPU" and self._needs_npu_static_reshape(model_type):
                 model = self.ov_core.read_model(model_path)
                 static_shape = self._get_npu_static_shape(model, model_type)
@@ -366,21 +370,30 @@ class OpenVINOModelRunner(BaseModelRunner):
                             model=model_path, device_name="CPU"
                         )
                 else:
-                    # Model has fully static shapes or can't determine target shape
-                    # Try NPU directly, fall back to CPU if it fails
+                    # Model has fully static input shapes or can't determine target.
+                    # For YOLOv9: strip NMS ops (unsupported on NPU) and run NMS on CPU.
+                    model, nms_stripped = self._strip_nms_for_npu(model, model_type)
                     try:
                         self.compiled_model = self.ov_core.compile_model(
                             model=model, device_name=device
                         )
+                        if nms_stripped:
+                            logger.info(
+                                "Compiled %s on NPU with NMS stripped "
+                                "(NMS will run on CPU post-inference)",
+                                model_type,
+                            )
                     except RuntimeError as e:
                         logger.warning(
                             "Failed to compile %s model on NPU: %s. Falling back to CPU",
                             model_type,
                             e,
                         )
+                        # Reload original model for CPU fallback
                         self.compiled_model = self.ov_core.compile_model(
                             model=model_path, device_name="CPU"
                         )
+                        self._npu_nms_params = None
             else:
                 self.compiled_model = self.ov_core.compile_model(
                     model=model_path, device_name=device
@@ -427,20 +440,24 @@ class OpenVINOModelRunner(BaseModelRunner):
 
     @staticmethod
     def _needs_npu_static_reshape(model_type: str) -> bool:
-        """Check if a model needs static reshape for NPU compilation.
+        """Check if a model needs special handling for NPU compilation.
 
-        NPU requires all input dimensions to be static. PaddleOCR models
-        have dynamic dimensions that must be fixed before compilation.
+        NPU requires all dimensions to be static. PaddleOCR models have
+        dynamic input dimensions. YOLOv9 has NMS ops that NPU cannot execute.
         """
         from frigate.embeddings.types import EnrichmentModelTypeEnum
 
-        return model_type == EnrichmentModelTypeEnum.paddleocr.value
+        return model_type in [
+            EnrichmentModelTypeEnum.paddleocr.value,
+            EnrichmentModelTypeEnum.yolov9_license_plate.value,
+        ]
 
     # Default static shapes for PaddleOCR models on NPU.
     # Classification: fixed 48x192 (from _preprocess_classification_image)
     # Recognition: fixed 48xW where W=PADDLEOCR_NPU_RECOGNITION_WIDTH
     # Detection: NOT reshaped (needs variable spatial input)
     PADDLEOCR_NPU_CLASSIFICATION_SHAPE = (48, 192)
+
 
     def _get_npu_static_shape(
         self, model: "ov.Model", model_type: str
@@ -454,7 +471,14 @@ class OpenVINOModelRunner(BaseModelRunner):
         - Recognition: [?,3,48,?] -> [1,3,48,320] (H=48 is static, only W dynamic)
         - Classification: [?,3,?,?] with output rank=2 -> [1,3,48,192]
         - Detection: [?,3,?,?] with spatial output -> None (can't use fixed shape)
+        - YOLOv9: static input, but contains NMS ops -> None (handled separately)
         """
+        from frigate.embeddings.types import EnrichmentModelTypeEnum
+
+        # YOLOv9 has static input shapes; NMS removal is handled in __init__
+        if model_type == EnrichmentModelTypeEnum.yolov9_license_plate.value:
+            return None
+
         inputs = model.inputs
         if not inputs:
             return None
@@ -503,6 +527,144 @@ class OpenVINOModelRunner(BaseModelRunner):
                     return None
 
         return None
+
+    def _strip_nms_for_npu(
+        self, model: "ov.Model", model_type: str
+    ) -> tuple["ov.Model", bool]:
+        """Strip NonMaxSuppression ops from model for NPU compilation.
+
+        NPU cannot execute NMS/TopK ops. This method removes NMS from the graph
+        and outputs raw boxes+scores instead. NMS is then done on CPU in run().
+
+        Returns:
+            Tuple of (model, was_nms_stripped). If NMS was stripped,
+            self._npu_nms_params is populated with the NMS parameters.
+        """
+        from frigate.embeddings.types import EnrichmentModelTypeEnum
+
+        if model_type != EnrichmentModelTypeEnum.yolov9_license_plate.value:
+            return model, False
+
+        # Find NMS node
+        nms_node = None
+        for op in model.get_ordered_ops():
+            if op.get_type_name() == "NonMaxSuppression":
+                nms_node = op
+                break
+
+        if nms_node is None:
+            return model, False
+
+        # Extract NMS parameters from constant inputs
+        iou_threshold = 0.45
+        score_threshold = 0.001
+        max_output_boxes = 100
+
+        for i in range(2, nms_node.get_input_size()):
+            src_node = nms_node.input(i).get_source_output().get_node()
+            if src_node.get_type_name() == "Constant":
+                val = float(src_node.get_data())
+                if i == 2:
+                    max_output_boxes = int(val)
+                elif i == 3:
+                    iou_threshold = val
+                elif i == 4:
+                    score_threshold = val
+
+        # Get pre-NMS outputs (boxes and scores)
+        boxes_output = nms_node.input(0).get_source_output()  # [1,N,4]
+        scores_output = nms_node.input(1).get_source_output()  # [1,1,N]
+
+        # Create new model outputting raw boxes and scores
+        input_param = model.inputs[0].get_node()
+        new_model = ov.Model(
+            results=[boxes_output, scores_output],
+            parameters=[input_param],
+            name=f"{model_type}_no_nms",
+        )
+
+        # Store NMS params for CPU post-processing
+        self._npu_nms_params = {
+            "iou_threshold": iou_threshold,
+            "score_threshold": score_threshold,
+            "max_output_boxes": max_output_boxes,
+        }
+
+        logger.info(
+            "Stripped NMS from %s for NPU (iou=%.3f, score=%.4f, max=%d)",
+            model_type,
+            iou_threshold,
+            score_threshold,
+            max_output_boxes,
+        )
+
+        return new_model, True
+
+    @staticmethod
+    def _cpu_nms_postprocess(
+        boxes: np.ndarray,
+        scores: np.ndarray,
+        iou_threshold: float,
+        score_threshold: float,
+        max_output_boxes: int,
+    ) -> list[np.ndarray]:
+        """Run NMS on CPU for models where NMS was stripped for NPU.
+
+        Args:
+            boxes: [1, N, 4] array of bounding boxes (x1, y1, x2, y2)
+            scores: [1, 1, N] array of confidence scores
+            iou_threshold: IoU threshold for NMS
+            score_threshold: Minimum score to keep
+            max_output_boxes: Maximum detections to return
+
+        Returns:
+            List containing single array of shape [max_output_boxes, 7]
+            matching original YOLOv9 output format:
+            [batch_idx, x1, y1, x2, y2, class_id, score]
+            Unused slots filled with -1.
+        """
+        scores_flat = scores[0, 0, :]  # [N]
+        mask = scores_flat > score_threshold
+        filtered_boxes = boxes[0, mask, :]  # [M, 4]
+        filtered_scores = scores_flat[mask]  # [M]
+
+        if len(filtered_scores) == 0:
+            result = np.full((max_output_boxes, 7), -1.0, dtype=np.float32)
+            return [result]
+
+        # NMS
+        order = filtered_scores.argsort()[::-1]
+        keep = []
+        while len(order) > 0 and len(keep) < max_output_boxes:
+            i = order[0]
+            keep.append(i)
+            if len(order) == 1:
+                break
+            rest_boxes = filtered_boxes[order[1:]]
+            xx1 = np.maximum(filtered_boxes[i, 0], rest_boxes[:, 0])
+            yy1 = np.maximum(filtered_boxes[i, 1], rest_boxes[:, 1])
+            xx2 = np.minimum(filtered_boxes[i, 2], rest_boxes[:, 2])
+            yy2 = np.minimum(filtered_boxes[i, 3], rest_boxes[:, 3])
+            inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+            area_i = (filtered_boxes[i, 2] - filtered_boxes[i, 0]) * (
+                filtered_boxes[i, 3] - filtered_boxes[i, 1]
+            )
+            area_j = (rest_boxes[:, 2] - rest_boxes[:, 0]) * (
+                rest_boxes[:, 3] - rest_boxes[:, 1]
+            )
+            iou = inter / (area_i + area_j - inter + 1e-6)
+            inds = np.where(iou <= iou_threshold)[0]
+            order = order[inds + 1]
+
+        # Build output in YOLOv9 format: [batch_idx, x1, y1, x2, y2, class_id, score]
+        result = np.full((max_output_boxes, 7), -1.0, dtype=np.float32)
+        for idx, k in enumerate(keep):
+            result[idx, 0] = 0.0  # batch index
+            result[idx, 1:5] = filtered_boxes[k]
+            result[idx, 5] = 0.0  # class id (single class)
+            result[idx, 6] = filtered_scores[k]
+
+        return [result]
 
     def run(self, inputs: dict[str, Any]) -> list[np.ndarray]:
         """Run inference with the model.
@@ -597,6 +759,16 @@ class OpenVINOModelRunner(BaseModelRunner):
             outputs = []
             for i in range(len(self.compiled_model.outputs)):
                 outputs.append(self.infer_request.get_output_tensor(i).data)
+
+            # If NMS was stripped for NPU, run NMS on CPU
+            if self._npu_nms_params is not None and len(outputs) == 2:
+                return self._cpu_nms_postprocess(
+                    boxes=outputs[0],
+                    scores=outputs[1],
+                    iou_threshold=self._npu_nms_params["iou_threshold"],
+                    score_threshold=self._npu_nms_params["score_threshold"],
+                    max_output_boxes=self._npu_nms_params["max_output_boxes"],
+                )
 
             return outputs
 

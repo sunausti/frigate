@@ -4,11 +4,12 @@ This document describes the changes made to enable Frigate's License Plate Recog
 
 ## Overview
 
-The LPR pipeline uses 4 models:
+The LPR pipeline uses 5 models:
 
 | Model | Purpose | Device | Latency (warm) |
 |-------|---------|--------|----------------|
 | SSD MobileNet V2 | Object detection (main detector) | NPU | ~5.4ms |
+| YOLOv9 License Plate | Plate region detection | NPU (NMS on CPU) | ~1ms + NMS |
 | PaddleOCR Detection | Text region detection | CPU (fallback) | ~29ms |
 | PaddleOCR Classification | Text orientation | NPU | ~4.4ms |
 | PaddleOCR Recognition | Character recognition | NPU | ~5.4ms |
@@ -21,13 +22,19 @@ Core NPU support logic in `OpenVINOModelRunner`:
 
 - **Removed `paddleocr` from NPU exclusion list** (`is_model_npu_supported`)
 - **Added `device` param to `is_complex_model()`** — PaddleOCR on NPU marked non-complex (no `reset_state` needed)
-- **Added `_needs_npu_static_reshape()`** — Identifies PaddleOCR models that need static input shapes for NPU
+- **Added `_needs_npu_static_reshape()`** — Identifies models that need special handling for NPU:
+  - PaddleOCR: dynamic input shapes need static reshape
+  - YOLOv9: contains NMS ops that NPU cannot execute
 - **Added `_get_npu_static_shape()`** — Determines correct static shape per model:
   - Recognition `[?,3,48,?]` → `[1,3,48,320]`
   - Classification `[?,3,?,?]` (rank-2 output) → `[1,3,48,192]`
   - Detection `[?,3,?,?]` (spatial output) → `None` (skip reshape)
+  - YOLOv9 → `None` (static input, NMS handled separately)
+- **Added `_strip_nms_for_npu()`** — Removes NonMaxSuppression/TopK ops from YOLOv9 graph for NPU compilation; stores NMS parameters for CPU post-processing
+- **Added `_cpu_nms_postprocess()`** — Runs NMS on CPU after NPU inference, outputs in original YOLOv9 format `[100, 7]`
 - **Added `_run_batched_single_input()`** — Handles batch>1 inference on NPU (compiled with batch=1)
-- **Added graceful CPU fallback** — If NPU compile fails, automatically falls back to CPU with a warning
+- **Added graceful CPU/GPU fallback** — If NPU compile fails, automatically falls back to CPU with a warning
+- **NMS post-processing in `run()`** — When `_npu_nms_params` is set, applies CPU NMS to raw NPU outputs
 - **Class constant `PADDLEOCR_NPU_RECOGNITION_WIDTH = 320`** — Fixed width for recognition model
 
 ### 2. `docker/main/Dockerfile`
@@ -274,6 +281,22 @@ adb shell "docker stop frigate_lpr_test"
 
 ## Limitations
 
+### YOLOv9 License Plate Detector — NMS Stripped for NPU
+
+The YOLOv9 model contains `NonMaxSuppression` and `TopK` ops that Intel NPU cannot execute (causes `ZE_RESULT_ERROR_DEVICE_LOST` — device hang). The model compiles successfully on NPU but crashes during inference.
+
+**Solution**: `_strip_nms_for_npu()` automatically detects and removes the NMS subgraph before NPU compilation:
+- Pre-NMS tensors (boxes `[1,1344,4]` + scores `[1,1,1344]`) are output from NPU (~1ms)
+- `_cpu_nms_postprocess()` runs NMS on CPU (microseconds for 1344 candidates)
+- Output format is preserved: `[100, 7]` matching the original `[batch_idx, x1, y1, x2, y2, class_id, score]`
+
+**NMS Parameters** (extracted from model constants at graph-strip time):
+- `iou_threshold`: 0.45
+- `score_threshold`: 0.001
+- `max_output_boxes`: 100
+
+**Performance**: NPU inference ~1ms vs GPU ~3ms (3x speedup), with negligible CPU NMS overhead.
+
 ### PaddleOCR Detection Model Cannot Run on NPU
 
 The detection model has fully dynamic spatial dimensions `[?,3,?,?]` and its output shape depends on input size. The mixin.py preprocessing resizes input images to variable dimensions (multiples of 32, up to 960x960) based on aspect ratio. Since NPU requires all dimensions to be static at compile time, this model cannot run on NPU without changing the preprocessing to always pad/resize to a fixed size (e.g., 960x960).
@@ -325,3 +348,584 @@ Recognition:    input=[?,3,48,?]     output=[?,1..,6625]   → H=48 static
 Classification: input=[?,3,?,?]      output=[?,2]          → rank-2 output (2 classes)
 Detection:      input=[?,3,?,?]      output=[?,1,32..,32..]→ spatial rank-4 output
 ```
+
+## Deployment on Android Devices (Verified Working)
+
+This section documents the verified deployment process on Android devices with Intel NPU.
+
+### Critical NPU Device Path Fix
+
+**Problem**: On Android systems, the NPU device is located at `/dev/accel0`, but OpenVINO's Intel NPU driver expects the standard Linux path `/dev/accel/accel0`. Without the correct path, OpenVINO will fail to detect the NPU with the error:
+
+```
+Unrecognized device ID! 0x0x0
+```
+
+**Solution**: Mount the device to BOTH paths when starting the container:
+
+```bash
+docker run -d \
+  --name frigate \
+  --privileged \
+  --shm-size=256m \
+  --device /dev/accel0:/dev/accel0 \
+  --device /dev/accel0:/dev/accel/accel0 \
+  --device /dev/dri:/dev/dri \
+  -v /data/frigate/config:/config \
+  -v /data/frigate/media:/media/frigate \
+  -p 5000:5000 \
+  -p 8554:8554 \
+  --restart=unless-stopped \
+  frigate:LPR_OV202602_v2
+```
+
+**Verification**: After starting the container, verify NPU is detected:
+
+```bash
+docker exec frigate python3 -c 'import openvino as ov; print(ov.Core().available_devices)'
+# Expected output: ['CPU', 'GPU', 'NPU']
+```
+
+### Complete Deployment Steps (via ADB)
+
+#### Step 1: Build and Save Image
+
+On development machine:
+
+```bash
+# Build the image (see "Build Instructions" section above)
+docker build -t frigate:LPR_OV202602_v2 -f docker/main/Dockerfile .
+
+# Save image to tar.gz (will be ~2.1GB compressed)
+docker save frigate:LPR_OV202602_v2 | gzip > /tmp/frigate_lpr_ov202602_v2.tar.gz
+```
+
+#### Step 2: Transfer Image to Device
+
+```bash
+# Connect device via ADB
+adb devices
+
+# Push image (takes ~2-3 minutes depending on USB speed)
+adb push /tmp/frigate_lpr_ov202602_v2.tar.gz /data/frigate_lpr.tar.gz
+
+# Load image on device
+adb shell "docker load -i /data/frigate_lpr.tar.gz"
+
+# Verify image loaded
+adb shell "docker images | grep frigate"
+```
+
+#### Step 3: Pre-download LPR Models (Recommended)
+
+If the device cannot access GitHub (DNS issues, proxy, firewall), pre-download models on development machine and push to device:
+
+```bash
+# On development machine, download models
+mkdir -p /tmp/lpr_models/paddleocr-onnx /tmp/lpr_models/yolov9
+
+cd /tmp/lpr_models/paddleocr-onnx
+wget https://github.com/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/v5/detection_v5-small.onnx
+wget https://github.com/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/classification.onnx
+wget https://github.com/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/v4/recognition_v4.onnx
+wget https://github.com/hawkeye217/paddleocr-onnx/raw/refs/heads/master/models/v4/ppocr_keys_v1.txt
+
+cd /tmp/lpr_models/yolov9
+wget https://github.com/hawkeye217/yolov9-license-plates/raw/refs/heads/master/models/yolov9-256-license-plates.onnx
+
+# Push models to device
+adb shell "mkdir -p /data/frigate/config/model_cache/paddleocr-onnx"
+adb shell "mkdir -p /data/frigate/config/model_cache/yolov9_license_plate"
+adb push /tmp/lpr_models/paddleocr-onnx/* /data/frigate/config/model_cache/paddleocr-onnx/
+adb push /tmp/lpr_models/yolov9/* /data/frigate/config/model_cache/yolov9_license_plate/
+```
+
+#### Step 4: Create Configuration
+
+Create minimal config on device:
+
+```bash
+adb shell "cat > /data/frigate/config/config.yml << 'EOF'
+mqtt:
+  enabled: false
+
+detectors:
+  openvino:
+    type: openvino
+    device: NPU
+
+lpr:
+  enabled: true
+  device: NPU
+
+cameras:
+  my_camera:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://your_camera_ip:554/stream
+          roles:
+            - detect
+    detect:
+      enabled: true
+      width: 1920
+      height: 1080
+      fps: 5
+
+logger:
+  default: info
+  logs:
+    frigate.detectors: info
+    frigate.embeddings: debug
+EOF
+"
+```
+
+#### Step 5: Start Container with Correct Device Paths
+
+```bash
+adb shell "docker run -d \
+  --name frigate \
+  --privileged \
+  --shm-size=256m \
+  --device /dev/accel0:/dev/accel0 \
+  --device /dev/accel0:/dev/accel/accel0 \
+  --device /dev/dri:/dev/dri \
+  -v /data/frigate/config:/config \
+  -v /data/frigate/media:/media/frigate \
+  -v /data/frigate/clips:/media/frigate/clips \
+  -v /data/frigate/recordings:/media/frigate/recordings \
+  -p 5000:5000 \
+  -p 8554:8554 \
+  -p 8555:8555/tcp \
+  -p 8555:8555/udp \
+  --restart=unless-stopped \
+  frigate:LPR_OV202602_v2"
+```
+
+#### Step 6: Verify NPU Detection and Model Loading
+
+```bash
+# Wait for startup (20-30 seconds)
+sleep 30
+
+# Check NPU detection
+adb shell "docker exec frigate python3 -c 'import openvino as ov; print(\"Devices:\", ov.Core().available_devices)'"
+# Expected: Devices: ['CPU', 'GPU', 'NPU']
+
+# Check logs for model loading
+adb shell "docker logs frigate 2>&1" | grep -E "NPU|Reshaping|Loading"
+
+# Check detector status via API
+adb shell "docker exec frigate curl -s http://localhost:5000/api/stats" | grep -A 5 detectors
+
+# Expected to see:
+# "detectors": {
+#     "openvino": {
+#         "inference_speed": 10.0,
+#         "detection_start": 0.0,
+#         ...
+```
+
+#### Step 7: Monitor LPR Performance
+
+```bash
+# View embeddings stats (includes plate_recognition metrics)
+adb shell "docker exec frigate curl -s http://localhost:5000/api/stats" | grep -A 3 embeddings
+
+# Check LPR logs
+adb shell "docker logs frigate 2>&1" | grep -i "plate\|lpr"
+```
+
+### Troubleshooting
+
+#### NPU Not Detected
+
+**Symptom**: `ov.Core().available_devices` returns `['CPU', 'GPU']` without `NPU`.
+
+**Root Cause**: Device path mismatch between Android (`/dev/accel0`) and OpenVINO expectation (`/dev/accel/accel0`).
+
+**Fix**: Ensure BOTH device paths are mounted:
+```bash
+--device /dev/accel0:/dev/accel0 \
+--device /dev/accel0:/dev/accel/accel0
+```
+
+**Verification**:
+```bash
+# Check device exists in container at both paths
+adb shell "docker exec frigate ls -la /dev/accel0 /dev/accel/accel0"
+# Both should show: crw-rw-rw-. 1 root 1003 261, 0 ...
+
+# Check device vendor/device ID
+adb shell "docker exec frigate cat /sys/class/accel/accel0/device/vendor"  # Should show: 0x8086
+adb shell "docker exec frigate cat /sys/class/accel/accel0/device/device"  # Should show: 0xb03e
+```
+
+#### Model Download Failures
+
+**Symptom**: `FileNotFoundError: OpenVINO model file /config/model_cache/paddleocr-onnx/detection_v5-small.onnx not found`
+
+**Root Cause**: Device cannot reach GitHub (DNS resolution failure, proxy, firewall).
+
+**Fix**: Pre-download and push models (see Step 3 above).
+
+#### NPU Compilation Errors
+
+**Symptom**: Logs show `Compilation failed. vclAllocatedExecutableCreate3 result: 0x78000004`
+
+**Possible Causes**:
+1. **Level Zero library version mismatch**: Container's `libze_intel_npu.so` version doesn't match device firmware
+2. **Model shape incompatibility**: Some models cannot be reshaped for NPU
+
+**Fix**: The code includes automatic CPU fallback. Models that fail NPU compilation will run on CPU with a warning.
+
+### Verified Hardware
+
+- **Device**: Intel Core Ultra X7 358H (with Intel AI Boost NPU)
+- **NPU Device ID**: `0x8086:0xb03e`
+- **OpenVINO**: 2026.2.0
+- **Platform**: Android-based system running Docker
+
+### Performance Metrics (Verified)
+
+| Component | Device | Inference Time |
+|-----------|--------|----------------|
+| Main Detector (SSD MobileNet V2) | NPU | ~10ms |
+| YOLOv9 License Plate Detection | NPU (NMS on CPU) | ~1ms + ~0.1ms NMS |
+| PaddleOCR Detection | CPU (fallback) | ~29ms |
+| PaddleOCR Classification | NPU | ~4.4ms |
+| PaddleOCR Recognition | NPU | ~5.4ms |
+
+**Total LPR Pipeline**: ~8ms plate recognition speed (verified with `plate_recognition_speed: 8.12`), ~4.2 plates/sec throughput.
+
+**End-to-End Verified Result**: `沪A·HG0162` recognized with confidence 1.000 on full NPU configuration.
+
+## Video Stream Setup with go2rtc (Verified Working)
+
+For testing LPR functionality without a live camera, you can use go2rtc to loop a video file and provide an RTSP stream.
+
+### Network Architecture: Host Network Mode (Recommended)
+
+**Problem**: When containers run on separate Docker bridge networks, Frigate cannot reliably connect to go2rtc's RTSP stream due to network isolation issues.
+
+**Solution**: Use **host network mode** for both containers. This eliminates network isolation and allows direct localhost communication.
+
+### Step 1: Prepare Video File
+
+```bash
+# Push test video to device
+adb push /path/to/test_video.mp4 /data/videos/test.mp4
+
+# Verify file exists
+adb shell "ls -lh /data/videos/test.mp4"
+```
+
+### Step 2: Configure and Start go2rtc Container
+
+Create go2rtc configuration:
+
+```bash
+# Create config directory
+adb shell "mkdir -p /data/go2rtc"
+
+# Create configuration file
+cat > /tmp/go2rtc.yaml << 'EOF'
+streams:
+  lpr_test:
+    # Loop video file with hardware acceleration
+    - ffmpeg:/videos/test.mp4#video=copy#audio=copy#rawArgs=-stream_loop -1 -re
+
+api:
+  listen: ":1984"
+
+rtsp:
+  listen: ":8556"
+
+webrtc:
+  listen: ":8557"
+
+log:
+  level: info
+EOF
+
+# Push config to device
+adb push /tmp/go2rtc.yaml /data/go2rtc/go2rtc.yaml
+```
+
+Start go2rtc container with host network:
+
+```bash
+adb shell "docker run -d \
+  --name go2rtc \
+  --restart=unless-stopped \
+  --network host \
+  --device /dev/dri:/dev/dri \
+  -v /data/go2rtc:/config \
+  -v /data/videos:/videos \
+  alexxit/go2rtc:latest"
+```
+
+**Key Configuration Notes**:
+- `--network host`: Uses host network namespace for direct localhost access
+- `--device /dev/dri:/dev/dri`: Provides GPU access (not used with `copy` mode, but needed if transcoding)
+- `#video=copy#audio=copy`: **Passthrough mode** — H.264 bitstream is forwarded directly without any decode/encode. go2rtc's ffmpeg neither uses CPU nor GPU for processing. This is the most efficient approach when the source video is already H.264.
+- `#rawArgs=-stream_loop -1 -re`: Loops video infinitely at original frame rate
+- Video decoding happens on the **Frigate side**, where ffmpeg uses VAAPI GPU hardware acceleration (`-hwaccel vaapi`) for decoding the H.264 stream into raw frames for detection.
+
+### Step 3: Verify go2rtc Stream
+
+```bash
+# Check stream status via API
+adb shell "curl -s http://localhost:1984/api/streams"
+
+# Expected output (formatted):
+# {
+#   "lpr_test": {
+#     "producers": [{
+#       "format_name": "rtsp",
+#       "source": "exec:ffmpeg ... /videos/test.mp4 ...",
+#       "medias": ["video, recvonly, H264", "audio, recvonly, PCML/48000"]
+#     }],
+#     "consumers": [...]
+#   }
+# }
+```
+
+### Step 4: Configure Frigate to Use go2rtc Stream
+
+Create Frigate configuration:
+
+```bash
+cat > /tmp/frigate_config.yml << 'EOF'
+mqtt:
+  enabled: false
+
+detectors:
+  openvino:
+    type: openvino
+    device: NPU
+
+lpr:
+  enabled: true
+  device: NPU
+
+cameras:
+  lpr_camera:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8556/lpr_test
+          roles:
+            - detect
+    detect:
+      enabled: true
+      width: 1920
+      height: 1080
+      fps: 5
+    motion:
+      enabled: false  # Disable motion detection to force detection on every frame
+    objects:
+      track:
+        - car
+        - person
+        - license_plate
+
+logger:
+  default: info
+  logs:
+    frigate.detectors: info
+    frigate.embeddings: debug
+EOF
+
+# Push config to device
+adb push /tmp/frigate_config.yml /data/frigate/config/config.yml
+```
+
+**Configuration Notes**:
+- `path: rtsp://127.0.0.1:8556/lpr_test`: Uses localhost because of host network mode
+- `motion.enabled: false`: Forces detection on every frame (useful for testing)
+- `objects.track`: Must include `car` or vehicles for LPR to trigger on detected vehicles
+
+### Step 5: Start Frigate Container with Host Network
+
+```bash
+adb shell "docker run -d \
+  --name frigate \
+  --privileged \
+  --shm-size=256m \
+  --network host \
+  --device /dev/accel0:/dev/accel0 \
+  --device /dev/accel0:/dev/accel/accel0 \
+  --device /dev/dri:/dev/dri \
+  -v /data/frigate/config:/config \
+  -v /data/frigate/media:/media/frigate \
+  -v /data/frigate/clips:/media/frigate/clips \
+  -v /data/frigate/recordings:/media/frigate/recordings \
+  -v /data/videos:/data/videos \
+  --restart=unless-stopped \
+  frigate:LPR_OV202602_v2"
+```
+
+**Key Configuration Notes**:
+- `--network host`: Shares host network with go2rtc for localhost RTSP access
+- Both NPU device paths (`/dev/accel0` and `/dev/accel/accel0`) required
+- No port mappings needed with host network mode
+
+### Step 6: Verify Video Stream Connection
+
+Wait 30-40 seconds for container startup, then check connection:
+
+```bash
+# Check camera stats
+adb shell "docker exec frigate curl -s http://localhost:5000/api/stats" | grep -A 15 lpr_camera
+
+# Expected output:
+# "lpr_camera": {
+#     "camera_fps": 5.1,              # ✓ Receiving video frames
+#     "process_fps": 5.1,             # ✓ Processing frames
+#     "detection_fps": 5.0,           # ✓ Running detection
+#     "connection_quality": "excellent", # ✓ Stable connection
+#     "reconnects_last_hour": 0,      # ✓ No reconnects
+#     ...
+# }
+```
+
+**Success Indicators**:
+- ✅ `camera_fps > 0`: Video stream connected
+- ✅ `connection_quality: "excellent"`: Stable RTSP connection
+- ✅ `reconnects_last_hour: 0`: No connection issues
+- ✅ `detection_fps > 0`: NPU detection running
+
+### Step 7: Monitor LPR Detection
+
+```bash
+# View embeddings/LPR stats
+adb shell "docker exec frigate curl -s http://localhost:5000/api/stats" | grep -A 5 embeddings
+
+# Expected output:
+# "embeddings": {
+#     "plate_recognition_speed": 15.2,  # NPU inference time
+#     "plate_recognition": 0.5          # Plates recognized per second
+# }
+
+# Check detected events
+adb shell "docker exec frigate curl -s http://localhost:5000/api/events"
+```
+
+### Troubleshooting Video Streams
+
+#### Stream 404 Not Found
+
+**Symptom**: `[in#0] method DESCRIBE failed: 404 (Not Found)`
+
+**Causes & Fixes**:
+
+1. **go2rtc not started**: 
+   ```bash
+   adb shell "docker ps | grep go2rtc"  # Should show "Up X minutes"
+   ```
+
+2. **Stream configuration error**:
+   ```bash
+   adb shell "curl -s http://localhost:1984/api/streams"
+   # Should show "lpr_test" with producers
+   ```
+
+3. **Incorrect stream name**: Verify Frigate config matches go2rtc stream name (`lpr_test`)
+
+#### Connection Refused / Timeout
+
+**Symptom**: `Connection to tcp://127.0.0.1:8556 failed: Connection refused`
+
+**Cause**: Not using host network mode, or go2rtc not listening.
+
+**Fix**: Ensure both containers use `--network host`
+
+**Verify**:
+```bash
+# Check go2rtc is listening on 8556
+adb shell "netstat -tlnp | grep 8556"
+# Should show: tcp6 ... :::8556 ... LISTEN 9026/go2rtc
+```
+
+#### Zero FPS Despite Connection
+
+**Symptom**: `camera_fps: 0` or `detection_fps: 0`
+
+**Causes**:
+
+1. **No objects tracked**: Add objects to config:
+   ```yaml
+   objects:
+     track:
+       - car
+       - license_plate
+   ```
+
+2. **Motion detection blocking**: Disable motion for testing:
+   ```yaml
+   motion:
+     enabled: false
+   ```
+
+3. **Video file not accessible**:
+   ```bash
+   adb shell "docker exec go2rtc ls -lh /videos/test.mp4"
+   ```
+
+### Alternative: Using Frigate's Built-in go2rtc
+
+Instead of a separate go2rtc container, Frigate includes an embedded go2rtc instance:
+
+```yaml
+# In Frigate config.yml
+go2rtc:
+  streams:
+    lpr_test:
+      - ffmpeg:/data/videos/test.mp4#video=copy#audio=copy#rawArgs=-stream_loop -1 -re
+
+cameras:
+  lpr_camera:
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/lpr_test  # Port 8554 for internal go2rtc
+          roles:
+            - detect
+```
+
+**Note**: Must mount video file into Frigate container:
+```bash
+-v /data/videos:/data/videos
+```
+
+### Performance Considerations
+
+**Stream Encoding (go2rtc side)**:
+- `#video=copy` = **passthrough** (no CPU/GPU usage on go2rtc side, zero processing overhead)
+- `#hardware=vaapi` = GPU transcoding (only needed if source is not H.264)
+- `#video=h264` = CPU transcoding (fallback, high CPU usage)
+- **Recommended**: Always use `copy` when source is already H.264
+
+**Video Decoding (Frigate side)**:
+- Frigate's ffmpeg automatically uses VAAPI GPU hardware acceleration for decoding
+- Verified by: `-hwaccel vaapi -hwaccel_device /dev/dri/renderD128` in ffmpeg cmdline
+- GPU decode uses ~4% of iGPU (shown in `gpu_usages.dec` stats)
+- Detection frames are decoded on GPU then downloaded to CPU memory for inference
+
+**Network Bandwidth**:
+- Host network mode = zero network overhead
+- Bridge network mode = copy overhead through Docker bridge
+
+**Video File Format**:
+- **Recommended**: H.264/AAC MP4 (native RTSP passthrough, no transcoding)
+- **Avoid**: VP9/AV1 (requires CPU/GPU transcoding on go2rtc side)
+
+### Verified Stream Configuration
+
+**Tested Setup**:
+- Video file: 1920x1080 H.264 @ 30 FPS, 280MB
+- go2rtc: Loop playback with passthrough (`-c:v copy`), zero CPU/GPU usage
+- Frigate: VAAPI GPU decode → 5 FPS detection on NPU
+- Connection: Host network, localhost RTSP
+- Result: Stable 5.1 FPS, excellent quality, 0 reconnects
