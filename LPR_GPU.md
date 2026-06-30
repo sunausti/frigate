@@ -59,6 +59,7 @@ log:
   level: info
 EOF'
 ```
+visit http://<host>:1984/stream.html?src=lpr_test for web open video
 
 ### 3. Start go2rtc Container
 
