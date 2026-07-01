@@ -929,3 +929,453 @@ cameras:
 - Frigate: VAAPI GPU decode → 5 FPS detection on NPU
 - Connection: Host network, localhost RTSP
 - Result: Stable 5.1 FPS, excellent quality, 0 reconnects
+
+## End-to-End LPR → OpenClaw Notification Pipeline
+
+### Pipeline Architecture
+
+```
+┌─────────────┐    RTSP     ┌─────────────┐   events API   ┌──────────────┐
+│   go2rtc    │───────────▶│   Frigate    │◀──── poll ─────│   OpenClaw   │
+│ (video loop)│  H.264 copy │  (LPR GPU)  │                │  (listener)  │
+└─────────────┘             └──────┬──────┘                └──────┬───────┘
+                                   │                              │
+                                   │ MQTT (state)                 │ openclaw agent
+                                   ▼                              ▼
+                            ┌─────────────┐              ┌───────────────┐
+                            │  Mosquitto  │              │ vision-care   │
+                            │   broker    │              │    agent      │
+                            └─────────────┘              └───────────────┘
+```
+
+**Data flow (per frame):**
+
+```
+Video frame (1920x1080)
+  │
+  ▼
+Motion Detection → triggers LPR pipeline
+  │
+  ▼
+YOLOv9 License Plate Detection (GPU, ~9ms)
+  │  detects plate bounding box
+  ▼
+PaddleOCR Detection → Classification → Recognition (GPU/CPU)
+  │  extracts plate characters
+  ▼
+Cluster & Match → "沪A·HG0162" (conf: 0.952)
+  │
+  ▼
+Event stored in Frigate DB (/api/events)
+  │
+  ▼ (polled every 5s by OpenClaw listener)
+frigate-notify.sh → downloads snapshot → openclaw agent --message "车牌识别摄像头检测到车牌 沪A·HG0162"
+  │
+  ▼
+OpenClaw vision-care agent processes notification
+```
+
+### Docker Deployment (Complete)
+
+Five containers run on the Android device with `--network host`:
+
+| Container | Image | Purpose | Port |
+|-----------|-------|---------|------|
+| `go2rtc` | `alexxit/go2rtc:latest` | Video loop → RTSP stream | 8556 (RTSP), 1984 (API) |
+| `frigate` | `frigate:LPR_OV202602_v2` | Object detection + LPR | 5000 (API) |
+| `mosquitto` | `eclipse-mosquitto:2` | MQTT broker | 1883 |
+| `openclaw-basic-chat` | `openclaw-basic-chat:*` | AI agent platform | 18789 (gateway) |
+| `ovms-qwen36` | `openvino/model_server:2026.2-gpu` | LLM inference | — |
+
+#### Deploy Mosquitto Broker
+
+```bash
+# Create config
+adb shell "mkdir -p /data/mosquitto && echo -e 'listener 1883\nallow_anonymous true' > /data/mosquitto/mosquitto.conf"
+
+# Start container
+adb shell "docker run -d \
+  --name mosquitto \
+  --network host \
+  --restart=unless-stopped \
+  -v /data/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf \
+  eclipse-mosquitto:2"
+
+# Verify
+adb shell "docker logs mosquitto 2>&1 | grep 'running'"
+# Expected: mosquitto version 2.1.2 running
+```
+
+#### Deploy Frigate with MQTT + GPU
+
+```bash
+adb shell "docker run -d \
+  --name frigate \
+  --privileged \
+  --shm-size=256m \
+  --network host \
+  --device /dev/accel0:/dev/accel0 \
+  --device /dev/accel0:/dev/accel/accel0 \
+  --device /dev/dri:/dev/dri \
+  -v /data/frigate/config:/config \
+  -v /data/frigate/media:/media/frigate \
+  -v /data/videos:/data/videos \
+  --restart=unless-stopped \
+  frigate:LPR_OV202602_v2"
+```
+
+#### Frigate config.yml (GPU mode, with MQTT)
+
+```yaml
+mqtt:
+  enabled: true
+  host: 127.0.0.1
+  port: 1883
+  topic_prefix: frigate
+
+detectors:
+  openvino:
+    type: openvino
+    device: GPU
+
+model:
+  width: 300
+  height: 300
+  input_tensor: nhwc
+
+lpr:
+  enabled: true
+  device: GPU
+  detection_threshold: 0.3
+  recognition_threshold: 0.7
+  min_plate_length: 5
+  min_area: 300
+  model_size: small
+  debug_save_plates: true
+  known_plates:
+    Test_Car:
+      - 沪AHG0162
+
+cameras:
+  lpr_camera:
+    enabled: true
+    type: lpr
+    lpr:
+      enabled: true
+      enhancement: 3
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8556/lpr_test
+          roles:
+            - detect
+    detect:
+      enabled: false
+      width: 1920
+      height: 1080
+      fps: 5
+    objects:
+      track: []
+    motion:
+      enabled: true
+      threshold: 10
+      contour_area: 5
+      improve_contrast: true
+
+logger:
+  default: info
+  logs:
+    frigate.detectors: info
+    frigate.embeddings: debug
+    frigate.data_processing.common.license_plate: debug
+version: 0.18-0
+```
+
+### Known Issues & Fixes
+
+#### NPU `ZE_RESULT_ERROR_DEVICE_LOST` / `ZE_RESULT_ERROR_UNKNOWN`
+
+**Symptom**: Every frame reports:
+```
+Error running YOLOv9 license plate detection model: ...
+L0 zeCommandQueueExecuteCommandLists result: ZE_RESULT_ERROR_UNKNOWN, code 0x7ffffffe
+```
+
+YOLOv9 compiles to NPU successfully but inference hangs on first frame. All subsequent frames also fail. PaddleOCR classification/recognition models may still work on NPU.
+
+**Root Cause**: NPU hardware enters an unrecoverable state after extended use (observed after ~7 days uptime). Docker restart does NOT reset the NPU — the device firmware needs a full reset.
+
+**Workaround**: Switch `lpr.device` and `detectors.device` from `NPU` to `GPU`:
+```yaml
+detectors:
+  openvino:
+    type: openvino
+    device: GPU    # was: NPU
+
+lpr:
+  enabled: true
+  device: GPU      # was: NPU
+```
+
+**Performance impact**: YOLOv9 inference goes from ~1ms (NPU) to ~9ms (GPU). Total LPR pipeline still fast enough for real-time processing.
+
+**Permanent fix**: Reboot the Android device (`adb reboot`) to reset NPU hardware state, then switch back to `device: NPU`.
+
+#### `motion.enabled: false` + `detect.enabled: true` — Config Validation Error
+
+**Symptom**: Frigate enters safe mode with:
+```
+Camera lpr_camera has motion detection disabled and object detection enabled
+but object detection requires motion detection.
+```
+
+**Fix**: Use `type: lpr` dedicated camera mode (does not require `detect.enabled: true`) OR enable both motion and detect:
+```yaml
+cameras:
+  lpr_camera:
+    type: lpr           # dedicated LPR mode
+    detect:
+      enabled: false    # not needed for type: lpr
+    motion:
+      enabled: true     # must be true
+```
+
+#### Dedicated LPR Camera Does Not Publish to `frigate/events` MQTT Topic
+
+**Symptom**: Plates are recognized and stored in the database (`/api/events`), but no messages appear on `frigate/events` MQTT topic.
+
+**Root Cause**: The `create_lpr_event()` path in `object_processing.py` sends events to the internal event maintainer (database) but does NOT call `dispatcher.publish("events", ...)` which is the MQTT publisher. Only `TrackedObject` updates (from `detect.enabled: true` cameras) publish to MQTT.
+
+**Workaround**: Use API polling instead of MQTT subscription for dedicated LPR events. The OpenClaw listener polls `GET /api/events?camera=lpr_camera&limit=5&has_plate=1` every 5 seconds.
+
+### OpenClaw Notification Scripts
+
+#### Listener: `frigate-mqtt-listener.py`
+
+Located at `/opt/openclaw-env/scripts/frigate-mqtt-listener.py` inside the `openclaw-basic-chat` container.
+
+Polls Frigate's events API for new plate recognitions and triggers notifications:
+
+```python
+#!/usr/bin/env python3
+"""Frigate LPR event listener - polls events API and triggers OpenClaw agent."""
+import json
+import os
+import subprocess
+import time
+import urllib.request
+
+FRIGATE_URL = os.environ.get("FRIGATE_URL", "http://127.0.0.1:5000")
+CAMERA_FILTER = os.environ.get("FRIGATE_CAMERA_FILTER", "lpr_camera")
+EVENT_COOLDOWN = int(os.environ.get("FRIGATE_EVENT_COOLDOWN", "30"))
+POLL_INTERVAL = 5
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+NOTIFY_SCRIPT = os.path.join(SCRIPT_DIR, "frigate-notify.sh")
+
+seen_events = set()
+last_notify_at = 0
+
+
+def poll_events():
+    global last_notify_at
+
+    url = f"{FRIGATE_URL}/api/events?camera={CAMERA_FILTER}&limit=5&has_plate=1"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            events = json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"[frigate-lpr] poll error: {e}", flush=True)
+        return
+
+    for event in events:
+        event_id = event.get("id", "")
+        if event_id in seen_events:
+            continue
+
+        plate = event.get("data", {}).get("recognized_license_plate", "")
+        camera = event.get("camera", "")
+
+        if not plate or not camera:
+            seen_events.add(event_id)
+            continue
+
+        now = int(time.time())
+        if (now - last_notify_at) < EVENT_COOLDOWN:
+            seen_events.add(event_id)
+            continue
+
+        seen_events.add(event_id)
+        last_notify_at = now
+
+        print(f"[frigate-lpr] plate={plate} event={event_id} camera={camera}", flush=True)
+        subprocess.Popen([NOTIFY_SCRIPT, camera, event_id, plate])
+
+
+def main():
+    print(f"[frigate-lpr] polling {FRIGATE_URL}/api/events camera={CAMERA_FILTER} "
+          f"cooldown={EVENT_COOLDOWN}s interval={POLL_INTERVAL}s", flush=True)
+    time.sleep(10)
+
+    while True:
+        poll_events()
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Environment variables** (from OpenClaw container):
+- `FRIGATE_URL=http://127.0.0.1:5000`
+- `FRIGATE_CAMERA_FILTER=lpr_camera`
+- `FRIGATE_EVENT_COOLDOWN=30`
+
+#### Notify: `frigate-notify.sh`
+
+Located at `/opt/openclaw-env/scripts/frigate-notify.sh`. Downloads a snapshot from Frigate and calls `openclaw agent` to notify the vision-care agent:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: $0 <camera> <event-id> [plate]" >&2
+  exit 64
+fi
+
+CAMERA="$1"
+EVENT_ID="$2"
+PLATE="${3:-}"
+FRIGATE_URL="${FRIGATE_URL:-http://127.0.0.1:5000}"
+OPENCLAW_AGENT="${VISION_CARE_AGENT_ID:-vision-care}"
+OPENCLAW_TMP="/tmp/openclaw-1000"
+GALLERY_DIR="/home/node/.openclaw/workspace-vision-care/Gallery/frigate"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+SNAPSHOT="$GALLERY_DIR/${CAMERA}-${EVENT_ID}-${STAMP}.jpg"
+ALERT_STAMP="$(date +%m%d_%H%M)"
+case "$CAMERA" in
+  cam1)
+    ALERT_SNAPSHOT="/tmp/openclaw-1000/frigate_cam1_${ALERT_STAMP}_alert.jpg"
+    ;;
+  *)
+    ALERT_SNAPSHOT="$OPENCLAW_TMP/frigate_${CAMERA}_alert.jpg"
+    ;;
+esac
+
+mkdir -p "$GALLERY_DIR" "$OPENCLAW_TMP"
+
+# Try event snapshot first, fall back to latest frame
+if ! curl -fsSL "$FRIGATE_URL/api/events/$EVENT_ID/snapshot.jpg" -o "$SNAPSHOT"; then
+  if ! curl -fsSL "$FRIGATE_URL/api/$CAMERA/latest.jpg" -o "$SNAPSHOT"; then
+    echo "[frigate-notify] Could not get snapshot, proceeding without image"
+    SNAPSHOT=""
+  fi
+fi
+
+if [ -n "$SNAPSHOT" ]; then
+  if [ "$CAMERA" = "cam1" ]; then
+    rm -f "$OPENCLAW_TMP"/frigate_cam1*.jpg
+  fi
+  cp "$SNAPSHOT" "$ALERT_SNAPSHOT"
+fi
+
+case "$CAMERA" in
+  cam1)
+    LOCATION="行车记录仪"
+    ;;
+  cam2)
+    LOCATION="客厅"
+    ;;
+  aqara)
+    LOCATION="餐厅"
+    ;;
+  lpr_camera)
+    LOCATION="车牌识别摄像头"
+    ;;
+  *)
+    LOCATION="$CAMERA"
+    ;;
+esac
+
+if [ -n "$PLATE" ] && [ -n "$SNAPSHOT" ]; then
+  MSG="${LOCATION}检测到车牌 ${PLATE}。截图路径：${ALERT_SNAPSHOT}。必须原样使用消息里的截图路径调用 image 工具；不要改写路径；不要使用 find 搜索 workspace；不要重新猜测或寻找其他截图。"
+elif [ -n "$PLATE" ]; then
+  MSG="${LOCATION}检测到车牌 ${PLATE}。"
+else
+  MSG="Frigate detected motion from ${LOCATION}."
+fi
+
+openclaw agent \
+  --agent "$OPENCLAW_AGENT" \
+  --session-key "agent:${OPENCLAW_AGENT}:traffic-light-alerts" \
+  --message "$MSG"
+```
+
+#### Startup Hook: `50-frigate-mqtt-listener.sh`
+
+Located at `/opt/openclaw-env/hooks/50-frigate-mqtt-listener.sh`. Auto-starts the listener when OpenClaw container boots:
+
+```bash
+#!/bin/sh
+
+LOG_FILE="/tmp/frigate-mqtt-listener.log"
+
+if pgrep -f "frigate-mqtt-listener.py" >/dev/null 2>&1; then
+    echo "[frigate-mqtt] listener already running"
+    return 0 2>/dev/null || exit 0
+fi
+
+export FRIGATE_CAMERA_FILTER=lpr_camera
+
+nohup python3 -u /opt/openclaw-env/scripts/frigate-mqtt-listener.py >"$LOG_FILE" 2>&1 &
+echo "[frigate-mqtt] listener started, log=$LOG_FILE"
+```
+
+### Verification
+
+#### Check Pipeline Health
+
+```bash
+# 1. Verify all containers are running
+adb shell "docker ps --format '{{.Names}}\t{{.Status}}'"
+
+# 2. Verify Mosquitto has Frigate connected
+adb shell "docker logs mosquitto 2>&1 | grep 'frigate'"
+# Expected: New client connected ... as frigate
+
+# 3. Verify Frigate is detecting plates
+adb shell "docker logs frigate --since 30s 2>&1 | grep 'Found license plate'"
+
+# 4. Verify events are in database
+adb shell "curl -s 'http://127.0.0.1:5000/api/events?limit=3'" | python3 -m json.tool
+
+# 5. Verify OpenClaw listener is polling
+adb shell "docker exec openclaw-basic-chat cat /tmp/frigate-mqtt-listener.log"
+# Expected: [frigate-lpr] plate=沪A·HG0162 event=... camera=lpr_camera
+
+# 6. Verify snapshot exists
+adb shell "docker exec openclaw-basic-chat ls -la /tmp/openclaw-1000/frigate_lpr_camera_alert.jpg"
+```
+
+#### Manual Test (Simulate Event)
+
+```bash
+# Publish a fake event to verify MQTT → OpenClaw flow
+adb shell "docker exec mosquitto mosquitto_pub -t 'frigate/events' \
+  -m '{\"type\":\"update\",\"after\":{\"id\":\"manual-test\",\"camera\":\"lpr_camera\",\"recognized_license_plate\":\"测试ABC123\"}}'"
+
+# Check listener received it (only works if listener uses MQTT mode)
+adb shell "docker exec openclaw-basic-chat cat /tmp/frigate-mqtt-listener.log"
+```
+
+### Performance (GPU Mode, Verified)
+
+| Component | Device | Inference Time |
+|-----------|--------|----------------|
+| Main Detector (SSD MobileNet V2) | GPU | ~15ms |
+| YOLOv9 License Plate Detection | GPU | ~9ms |
+| PaddleOCR Detection | CPU (fallback) | ~29ms |
+| PaddleOCR Classification | GPU | ~8ms |
+| PaddleOCR Recognition | GPU | ~10ms |
+| **Notification latency** | API poll | **≤5s** (poll interval) |
+
+**Verified plates recognized**: `沪A·HG0162`, `沪N·Z1079`, `沪A·A50521`, `豫A625L0`, `皖E·4697`, `沪ABV5385`
