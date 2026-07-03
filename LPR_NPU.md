@@ -1379,3 +1379,123 @@ adb shell "docker exec openclaw-basic-chat cat /tmp/frigate-mqtt-listener.log"
 | **Notification latency** | API poll | **≤5s** (poll interval) |
 
 **Verified plates recognized**: `沪A·HG0162`, `沪N·Z1079`, `沪A·A50521`, `豫A625L0`, `皖E·4697`, `沪ABV5385`
+
+## Repository Change Audit (2026-07-03)
+
+Audit of the local repo to confirm every source change required for NPU LPR is
+committed, and record of the `LPR_OV20260703_v1` rebuild/redeploy.
+
+### Root Cause of the "NPU doesn't work" Regression
+
+The device was running image `frigate:LPR_OV202602_v2`, which shipped an **older**
+`frigate/detectors/detection_runners.py` whose `_needs_npu_static_reshape()`
+returned `True` for `paddleocr` **only** — not `yolov9_license_plate`. As a
+result, YOLOv9 fell through to the `else` branch and the **full NMS+TopK ONNX was
+compiled directly onto the NPU**. That graph compiles successfully but hangs at
+inference on every frame:
+
+```
+frigate.data_processing.common.license_plate.mixin WARNING : Error running YOLOv9
+  license plate detection model: Exception from src/inference/src/cpp/infer_request.cpp:224:
+L0 zeCommandQueueExecuteCommandLists result: ZE_RESULT_ERROR_UNKNOWN, code 0x7ffffffe
+```
+
+This is **not** a firmware/reboot-recoverable NPU fault. It was reproduced from a
+fresh reboot (device uptime 8 min, NPU present as `0x8086:0xb03e`) and after
+container restarts. Isolation tests inside the same container on the same NPU:
+
+| Graph run on NPU (30 iters, real data, `NPU_TURBO=YES`) | Result |
+|---------------------------------------------------------|--------|
+| Full ONNX with `NonMaxSuppression`+`TopK` baked in       | compiles OK, **inference fails every frame** (`ZE_RESULT_ERROR`) |
+| NMS-stripped graph (`boxes[1,1344,4]` + `scores[1,1,1344]`) | **0 failures, ~0.65ms warm** |
+| paddleocr cls + rec + yolov9(no-nms) all on NPU, one `Core` | 0 failures |
+
+Conclusion: the NPU hardware and the stripped graph are fine; the only problem was
+the stale `detection_runners.py`. Re-exporting the model with `nms=False` was
+**not** required — `_strip_nms_for_npu()` already produces the equivalent no-NMS
+graph at runtime.
+
+### Source Change Verification (all committed, clean working tree)
+
+| File | Required change | Status |
+|------|-----------------|--------|
+| `frigate/detectors/detection_runners.py` | `_strip_nms_for_npu` (l.531), `_cpu_nms_postprocess` (l.604), `_get_npu_static_shape` (l.462), `_run_batched_single_input` (l.775), `_needs_npu_static_reshape` incl. `yolov9_license_plate` (l.442), `PADDLEOCR_NPU_RECOGNITION_WIDTH` (l.268) | ✅ present |
+| `docker/main/Dockerfile` | `npu-libs` build stage (l.64) + `COPY --from=npu-libs /npu-rootfs/ /` | ✅ present (compiler libs added 2026-07-03) |
+| `docker/main/requirements-wheels.txt` | `openvino == 2026.2.*` (l.45) | ✅ present |
+| `docker/main/requirements-ov.txt` | `openvino-dev==2024.6.0` | ✅ present |
+
+### ✅ Resolved: Dockerfile `npu-libs` Stage Now Includes Compiler Libraries
+
+Previously the main `docker/main/Dockerfile` `npu-libs` stage copied only the
+driver/loader libraries (`libnpu_driver_compiler.so`, `libze_intel_npu.so.1.32.1`,
+`libze_loader.so.1.27.0`) and omitted the two NPU **compiler** libraries that a
+working NPU runtime requires:
+
+- `libopenvino_intel_npu_compiler.so` (~117 MB)
+- `libopenvino_intel_npu_compiler_loader.so`
+
+These are **not** shipped in the pip `openvino` wheel (only the `_plugin.so` is),
+so a fresh **full** build straight from `docker/main/Dockerfile` used to be missing
+them and NPU would fail to compile any model. As of 2026-07-03 the `npu-libs` stage
+copies them into `/usr/local/lib/python3.11/dist-packages/openvino/libs/`, so full
+builds are now self-sufficient (no `Dockerfile.patch` step required for NPU libs):
+
+```dockerfile
+FROM openvino/ubuntu24_dev:2026.2.0 AS npu-libs
+USER root
+RUN mkdir -p /npu-rootfs/usr/lib/x86_64-linux-gnu && \
+    cp /usr/lib/x86_64-linux-gnu/libnpu_driver_compiler.so /npu-rootfs/usr/lib/x86_64-linux-gnu/ && \
+    cp /usr/lib/x86_64-linux-gnu/libze_intel_npu.so.1.32.1 /npu-rootfs/usr/lib/x86_64-linux-gnu/ && \
+    ln -s libze_intel_npu.so.1.32.1 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_intel_npu.so.1 && \
+    ln -s libze_intel_npu.so.1 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_intel_npu.so && \
+    cp /usr/lib/x86_64-linux-gnu/libze_loader.so.1.27.0 /npu-rootfs/usr/lib/x86_64-linux-gnu/ && \
+    ln -s libze_loader.so.1.27.0 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_loader.so.1 && \
+    ln -s libze_loader.so.1 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_loader.so && \
+    mkdir -p /npu-rootfs/usr/local/lib/python3.11/dist-packages/openvino/libs && \
+    cp /opt/intel/openvino_2026.2.0.0/runtime/lib/intel64/libopenvino_intel_npu_compiler.so \
+       /npu-rootfs/usr/local/lib/python3.11/dist-packages/openvino/libs/ && \
+    cp /opt/intel/openvino_2026.2.0.0/runtime/lib/intel64/libopenvino_intel_npu_compiler_loader.so \
+       /npu-rootfs/usr/local/lib/python3.11/dist-packages/openvino/libs/
+```
+
+### Rebuild & Redeploy Record — `frigate:LPR_OV20260703_v1`
+
+Because only `detection_runners.py` changed, the new image was built on top of the
+existing NPU-lib-complete base (`LPR_OV202602_v2`) rather than a slow full build:
+
+```dockerfile
+# Dockerfile.lpr_npu
+FROM frigate:LPR_OV202602_v2
+COPY frigate/detectors/detection_runners.py /opt/frigate/frigate/detectors/detection_runners.py
+```
+
+```bash
+# build
+DOCKER_BUILDKIT=1 docker build -t frigate:LPR_OV20260703_v1 -f Dockerfile.lpr_npu .
+# save + push
+docker save frigate:LPR_OV20260703_v1 | gzip > frigate_LPR_OV20260703_v1.tar.gz   # ~2.1 GB
+adb push frigate_LPR_OV20260703_v1.tar.gz /data/vendor/docker/sunausti/frigate_image/
+adb shell "docker load -i /data/vendor/docker/sunausti/frigate_image/frigate_LPR_OV20260703_v1.tar.gz"
+# recreate container (same params as before: host net, privileged, both accel paths)
+adb shell "docker rm -f frigate"
+adb shell "docker run -d --name frigate --privileged --shm-size=256m --network host \
+  --device /dev/accel0:/dev/accel0 --device /dev/accel0:/dev/accel/accel0 --device /dev/dri:/dev/dri \
+  -v /data/frigate/config:/config -v /data/frigate/media:/media/frigate -v /data/videos:/data/videos \
+  --restart=unless-stopped frigate:LPR_OV20260703_v1"
+```
+
+### Post-Deploy Verification (NPU, config `device: NPU`)
+
+```
+frigate.detectors.detection_runners INFO : Stripped NMS from yolov9_license_plate for NPU (iou=0.450, score=0.0010, max=100)
+frigate.detectors.detection_runners INFO : Compiled yolov9_license_plate on NPU with NMS stripped (NMS will run on CPU post-inference)
+```
+
+- `ZE_RESULT_ERROR` count after deploy: **0**
+- Main detector (SSD): **~10ms** (NPU)
+- YOLOv9 plate detection: **~2.9ms** (NPU, NMS on CPU)
+- PaddleOCR recognition: **~13ms** (NPU), ~1.5 plates/sec
+- End-to-end recognized: **`沪A·HG0162` (conf 1.000)**
+
+The fix is now baked into the image layer, so it survives container
+recreation (not just `docker restart`).

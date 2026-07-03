@@ -70,7 +70,12 @@ RUN mkdir -p /npu-rootfs/usr/lib/x86_64-linux-gnu && \
     ln -s libze_intel_npu.so.1 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_intel_npu.so && \
     cp /usr/lib/x86_64-linux-gnu/libze_loader.so.1.27.0 /npu-rootfs/usr/lib/x86_64-linux-gnu/ && \
     ln -s libze_loader.so.1.27.0 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_loader.so.1 && \
-    ln -s libze_loader.so.1 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_loader.so
+    ln -s libze_loader.so.1 /npu-rootfs/usr/lib/x86_64-linux-gnu/libze_loader.so && \
+    mkdir -p /npu-rootfs/usr/local/lib/python3.11/dist-packages/openvino/libs && \
+    cp /opt/intel/openvino_2026.2.0.0/runtime/lib/intel64/libopenvino_intel_npu_compiler.so \
+       /npu-rootfs/usr/local/lib/python3.11/dist-packages/openvino/libs/ && \
+    cp /opt/intel/openvino_2026.2.0.0/runtime/lib/intel64/libopenvino_intel_npu_compiler_loader.so \
+       /npu-rootfs/usr/local/lib/python3.11/dist-packages/openvino/libs/
 
 FROM scratch AS go2rtc
 ARG TARGETARCH
